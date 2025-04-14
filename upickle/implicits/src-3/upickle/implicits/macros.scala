@@ -211,12 +211,37 @@ def applyConstructorImpl[T](using quotes: Quotes, t0: Type[T])(params: Expr[Arra
     val (tparams0, params0) = constructorParamSymss.flatten.partition(_.isType)
     val constructorTpe = tpe.memberType(constructorSym).widen
 
+    val companionRef = companion.termRef
+
+    val sub: (tpe: TypeRepr, tparams: List[Symbol]) => TypeRepr =
+      typeApply match
+        case Some(tps) => (tpe, tparams) => tpe.substituteTypes(tparams, tps)
+        case None => (tpe, tparams) => tpe
+
+    val apps = for
+      app <- companion.methodMember("apply")
+      info = companionRef.memberType(app).widen
+      (tps, ps) = app.paramSymss.flatten.partition(_.isType)
+      if tps.length == tparams0.length
+      if ps.length == params0.length
+      if tps.corresponds(tparams0)((t0, t1) =>
+        sub(info.memberType(t0), tps) =:= sub(constructorTpe.memberType(t1), tparams0)
+      )
+      if ps.corresponds(params0)((p0, p1) =>
+        sub(info.memberType(p0), tps) =:= sub(constructorTpe.memberType(p1), tparams0)
+      )
+    yield app
+
+    val matching = apps match
+      case app :: Nil => app
+      case _ => report.errorAndAbort(s"Cannot find a uniquely matching apply method in companion ${companionRef.show}")
+
+    val lhs = Select(Ref(companion), matching)
+
     val rhs = params0.zipWithIndex.map {
       case (sym0, i) =>
         val lhs = '{$params(${ Expr(i) })}
-        val tpe0 = constructorTpe.memberType(sym0)
-
-        typeApply.map(tps => tpe0.substituteTypes(tparams0, tps)).getOrElse(tpe0) match {
+        sub(constructorTpe.memberType(sym0), tparams0) match {
           case AnnotatedType(AppliedType(base, Seq(arg)), x)
             if x.tpe =:= defn.RepeatedAnnot.typeRef =>
             arg.asType match {
@@ -235,9 +260,8 @@ def applyConstructorImpl[T](using quotes: Quotes, t0: Type[T])(params: Expr[Arra
     }
 
     typeApply match{
-      case None => Select.overloaded(Ref(companion), "apply", Nil, rhs).asExprOf[T]
-      case Some(args) =>
-        Select.overloaded(Ref(companion), "apply", args, rhs).asExprOf[T]
+      case None => lhs.appliedToArgs(rhs).asExprOf[T]
+      case Some(args) => lhs.appliedToTypes(args).appliedToArgs(rhs).asExprOf[T]
     }
   }
 
@@ -363,4 +387,3 @@ def defineEnumVisitorsImpl[T0, T <: Tuple](prefix: Expr[Any], macroX: String)(us
   val allDefs = topTraitDefs.toList ::: subTypeDefs
 
   Block(allDefs.map(_._1), Ident(allDefs.head._2.termRef)).asExprOf[T0]
-
